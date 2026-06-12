@@ -78,6 +78,7 @@ function GyomuKanban() {
   const [pages, setPages] = useState({ todo: 0, doing: 0, stalled: 0, done: 0 }); // 各列の現在ページ
   const [draggingId, setDraggingId] = useState(null);
   const [dragOverCol, setDragOverCol] = useState(null);
+  const [dragOverCardId, setDragOverCardId] = useState(null); // 列内並べ替えのドロップ先カード
   const [draggingBoardId, setDraggingBoardId] = useState(null); // タブ並べ替え用
   const [dragOverBoardId, setDragOverBoardId] = useState(null);
   const CARDS_PER_PAGE = 6;
@@ -231,13 +232,25 @@ function GyomuKanban() {
     }
   };
 
+  // 列の空きスペースへドロップ → そのステータスの末尾へ移動
   const moveCardTo = async (id, status) => {
     const target = cards.find((c) => c.id === id);
-    if (!target || target.status === status) return;
-    const next = cards.map((c) =>
-      c.id === id ? { ...c, status, updatedAt: new Date().toISOString() } : c
-    );
+    if (!target) return;
+    const rest = cards.filter((c) => c.id !== id);
+    const next = [...rest, { ...target, status, updatedAt: new Date().toISOString() }];
     if (await persist(next)) setCards(next);
+  };
+
+  // カードの上へドロップ → そのカードの位置(直前)に挿入。列をまたぐ移動も同時に行う
+  const reorderCard = async (dragId, targetId, status) => {
+    if (!dragId || dragId === targetId) return;
+    const dragged = cards.find((c) => c.id === dragId);
+    if (!dragged) return;
+    const rest = cards.filter((c) => c.id !== dragId);
+    const tIdx = rest.findIndex((c) => c.id === targetId);
+    if (tIdx < 0) return;
+    rest.splice(tIdx, 0, { ...dragged, status, updatedAt: new Date().toISOString() });
+    if (await persist(rest)) setCards(rest);
   };
 
   const deleteCard = async (id) => {
@@ -448,6 +461,7 @@ function GyomuKanban() {
                   if (id) moveCardTo(id, s.key);
                   setDragOverCol(null);
                   setDraggingId(null);
+                  setDragOverCardId(null);
                 }}
                 className={`bg-white rounded-lg shadow-sm border-t-4 ${s.header} flex-1 min-w-60 shrink-0 flex flex-col overflow-hidden ${
                   dragOverCol === s.key && draggingId ? "ring-2 ring-indigo-400 bg-indigo-50" : ""
@@ -473,10 +487,31 @@ function GyomuKanban() {
                         e.dataTransfer.effectAllowed = "move";
                         setDraggingId(c.id);
                       }}
-                      onDragEnd={() => { setDraggingId(null); setDragOverCol(null); }}
+                      onDragEnd={() => { setDraggingId(null); setDragOverCol(null); setDragOverCardId(null); }}
+                      onDragOver={(e) => {
+                        if (!draggingId || draggingId === c.id) return;
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setDragOverCardId(c.id);
+                        setDragOverCol(s.key);
+                      }}
+                      onDragLeave={() => setDragOverCardId((v) => (v === c.id ? null : v))}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation(); // 列側のドロップ処理と二重に動かないように
+                        const id = e.dataTransfer.getData("text/plain") || draggingId;
+                        if (id) reorderCard(id, c.id, s.key);
+                        setDraggingId(null);
+                        setDragOverCol(null);
+                        setDragOverCardId(null);
+                      }}
                       onClick={() => { setOpenCardId(c.id); setMemo(""); setEditMode(false); setEditingNoteIdx(null); }}
-                      className={`border border-slate-200 rounded-lg px-3 py-2 hover:border-indigo-400 hover:shadow bg-white cursor-grab active:cursor-grabbing ${
+                      className={`border rounded-lg px-3 py-2 hover:border-indigo-400 hover:shadow bg-white cursor-grab active:cursor-grabbing ${
                         draggingId === c.id ? "opacity-40" : ""
+                      } ${
+                        dragOverCardId === c.id && draggingId && draggingId !== c.id
+                          ? "border-indigo-500 border-t-4" /* この位置に挿入されることを示す */
+                          : "border-slate-200"
                       }`}
                     >
                       <h3 className="font-semibold text-slate-800 text-sm leading-snug truncate">{c.title}</h3>

@@ -278,9 +278,13 @@ function GyomuKanban() {
       : cards;
     const ok = await persist(next);
     if (ok) {
+      const hadMemo = !!memo.trim();
       setMemo("");
       await loadCards(); // 保存後に再読込してページを更新
-      closeDetail(); // 保存したら詳細画面を自動で閉じる
+      if (!hadMemo) {
+        closeDetail(); // メモなしの保存はそのまま閉じる
+      }
+      // メモを追記した場合は画面を開いたままにする(閉じるのは×ボタンで)
       setSavedFlash(true);
       setTimeout(() => setSavedFlash(false), 1800);
     }

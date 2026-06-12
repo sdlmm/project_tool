@@ -1,0 +1,783 @@
+import { useState, useEffect, useCallback } from "react";
+import { Plus, X, User, Clock, ChevronLeft, ChevronRight, Trash2, FileText, Pencil } from "lucide-react";
+
+const STORAGE_KEY = "gyomu-board-data"; // ボード一覧+ボードごとのカードを一括保存
+const LEGACY_KEY = "gyomu-kanban-cards"; // 旧バージョンのデータ(自動移行用)
+
+// 現在の年度名を返す(4月始まり)
+const currentNendo = () => {
+  const now = new Date();
+  const y = now.getMonth() + 1 >= 4 ? now.getFullYear() : now.getFullYear() - 1;
+  return `${y}年度`;
+};
+
+const STATUSES = [
+  { key: "todo", label: "未対応", dot: "bg-rose-500", header: "border-rose-400", badge: "bg-rose-50 text-rose-700" },
+  { key: "doing", label: "処理中", dot: "bg-amber-500", header: "border-amber-400", badge: "bg-amber-50 text-amber-700" },
+  { key: "stalled", label: "停滞中", dot: "bg-violet-500", header: "border-violet-400", badge: "bg-violet-50 text-violet-700" },
+  { key: "done", label: "完了", dot: "bg-emerald-500", header: "border-emerald-400", badge: "bg-emerald-50 text-emerald-700" },
+];
+
+const fmtDate = (iso) => {
+  const d = new Date(iso);
+  return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+};
+
+export default function GyomuKanban() {
+  const [boards, setBoards] = useState([]); // [{id, name, createdAt}]
+  const [activeBoardId, setActiveBoardId] = useState(null);
+  const [cardsByBoard, setCardsByBoard] = useState({}); // {boardId: [cards]}
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [showNew, setShowNew] = useState(false);
+  const [showNewBoard, setShowNewBoard] = useState(false);
+  const [boardName, setBoardName] = useState("");
+  const [openCardId, setOpenCardId] = useState(null);
+  const [pages, setPages] = useState({ todo: 0, doing: 0, stalled: 0, done: 0 }); // 各列の現在ページ
+  const [draggingId, setDraggingId] = useState(null);
+  const [dragOverCol, setDragOverCol] = useState(null);
+  const [draggingBoardId, setDraggingBoardId] = useState(null); // タブ並べ替え用
+  const [dragOverBoardId, setDragOverBoardId] = useState(null);
+  const CARDS_PER_PAGE = 6;
+
+  // 選択中ボードのカード(派生値)
+  const cards = cardsByBoard[activeBoardId] || [];
+
+  // 新規カードフォーム
+  const [title, setTitle] = useState("");
+  const [desc, setDesc] = useState("");
+  const [assignee, setAssignee] = useState("");
+
+  // メモ追記
+  const [memo, setMemo] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [savedFlash, setSavedFlash] = useState(false);
+
+  // カード編集
+  const [editMode, setEditMode] = useState(false);
+  const [editTitle, setEditTitle] = useState("");
+  const [editAssignee, setEditAssignee] = useState("");
+  const [editDesc, setEditDesc] = useState("");
+  const [editDate, setEditDate] = useState("");
+
+  // メモ編集(notes配列の元のインデックスを保持)
+  const [editingNoteIdx, setEditingNoteIdx] = useState(null);
+  const [editNoteText, setEditNoteText] = useState("");
+
+  const loadCards = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const result = await window.storage.get(STORAGE_KEY);
+      if (result) {
+        const data = JSON.parse(result.value);
+        setBoards(data.boards || []);
+        setCardsByBoard(data.cardsByBoard || {});
+        setActiveBoardId((prev) => prev && (data.boards || []).some((b) => b.id === prev) ? prev : data.activeBoardId);
+        setLoading(false);
+        return;
+      }
+    } catch (e) {
+      // 新キーが存在しない → 旧データの移行を試みる
+    }
+    let oldCards = [];
+    try {
+      const legacy = await window.storage.get(LEGACY_KEY);
+      oldCards = legacy ? JSON.parse(legacy.value) : [];
+    } catch (e) {
+      oldCards = []; // 旧データもない初回
+    }
+    // 今年度のボードを作成(旧データがあれば引き継ぐ)
+    const board = { id: `board_${Date.now()}`, name: currentNendo(), createdAt: new Date().toISOString() };
+    const data = { boards: [board], activeBoardId: board.id, cardsByBoard: { [board.id]: oldCards } };
+    try {
+      await window.storage.set(STORAGE_KEY, JSON.stringify(data));
+    } catch (_) { /* 保存失敗時もUIは表示 */ }
+    setBoards(data.boards);
+    setCardsByBoard(data.cardsByBoard);
+    setActiveBoardId(board.id);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    loadCards();
+  }, [loadCards]);
+
+  // 全体構造を保存する共通処理
+  const persistAll = async (data) => {
+    try {
+      const result = await window.storage.set(STORAGE_KEY, JSON.stringify(data));
+      if (!result) throw new Error("保存に失敗しました");
+      return true;
+    } catch (e) {
+      setError("保存に失敗しました。もう一度お試しください。");
+      return false;
+    }
+  };
+
+  // 選択中ボードのカード一覧を保存
+  const persist = async (nextCards) => {
+    const nextByBoard = { ...cardsByBoard, [activeBoardId]: nextCards };
+    return persistAll({ boards, activeBoardId, cardsByBoard: nextByBoard });
+  };
+
+  // 選択中ボードのカード一覧を更新
+  const setCards = (nextCards) => {
+    setCardsByBoard((prev) => ({ ...prev, [activeBoardId]: nextCards }));
+  };
+
+  // 新しいボード(年度)を作成して切替
+  const createBoard = async () => {
+    if (!boardName.trim()) return;
+    const board = { id: `board_${Date.now()}`, name: boardName.trim(), createdAt: new Date().toISOString() };
+    const nextBoards = [...boards, board];
+    const nextByBoard = { ...cardsByBoard, [board.id]: [] };
+    if (await persistAll({ boards: nextBoards, activeBoardId: board.id, cardsByBoard: nextByBoard })) {
+      setBoards(nextBoards);
+      setCardsByBoard(nextByBoard);
+      setActiveBoardId(board.id);
+      setBoardName("");
+      setShowNewBoard(false);
+      setPages({ todo: 0, doing: 0, stalled: 0, done: 0 });
+      setOpenCardId(null);
+    }
+  };
+
+  // ボードの切替(過去年度の閲覧)
+  const switchBoard = async (id) => {
+    if (id === activeBoardId) return;
+    setActiveBoardId(id);
+    setPages({ todo: 0, doing: 0, stalled: 0, done: 0 });
+    setOpenCardId(null);
+    await persistAll({ boards, activeBoardId: id, cardsByBoard }); // 最後に開いたボードを記憶
+  };
+
+  // ボードタブの並べ替え(ドラッグしたタブをドロップ先の位置へ移動)
+  const reorderBoards = async (dragId, targetId) => {
+    if (!dragId || dragId === targetId) return;
+    const fromIdx = boards.findIndex((b) => b.id === dragId);
+    const toIdx = boards.findIndex((b) => b.id === targetId);
+    if (fromIdx < 0 || toIdx < 0) return;
+    const next = [...boards];
+    const [moved] = next.splice(fromIdx, 1);
+    next.splice(toIdx, 0, moved);
+    if (await persistAll({ boards: next, activeBoardId, cardsByBoard })) {
+      setBoards(next);
+    }
+  };
+
+  const addCard = async () => {
+    if (!title.trim()) return;
+    const now = new Date().toISOString();
+    const card = {
+      id: `card_${Date.now()}`,
+      title: title.trim(),
+      description: desc.trim(),
+      assignee: assignee.trim(),
+      status: "todo",
+      notes: [],
+      createdAt: now,
+      updatedAt: now,
+    };
+    const next = [card, ...cards];
+    if (await persist(next)) {
+      setCards(next);
+      setTitle("");
+      setDesc("");
+      setAssignee("");
+      setShowNew(false);
+    }
+  };
+
+  const moveCardTo = async (id, status) => {
+    const target = cards.find((c) => c.id === id);
+    if (!target || target.status === status) return;
+    const next = cards.map((c) =>
+      c.id === id ? { ...c, status, updatedAt: new Date().toISOString() } : c
+    );
+    if (await persist(next)) setCards(next);
+  };
+
+  const deleteCard = async (id) => {
+    const next = cards.filter((c) => c.id !== id);
+    if (await persist(next)) {
+      setCards(next);
+      setOpenCardId(null);
+    }
+  };
+
+  // メモを追記して保存 → ストレージから再読込(ページ更新)
+  // メモが未入力でも押せるようにし、その場合は現在の内容を保存し直して画面を更新する
+  const saveMemo = async () => {
+    setSaving(true);
+    const next = memo.trim()
+      ? cards.map((c) =>
+          c.id === openCardId
+            ? {
+                ...c,
+                notes: [...c.notes, { text: memo.trim(), date: new Date().toISOString() }],
+                updatedAt: new Date().toISOString(),
+              }
+            : c
+        )
+      : cards;
+    const ok = await persist(next);
+    if (ok) {
+      setMemo("");
+      await loadCards(); // 保存後に再読込してページを更新
+      closeDetail(); // 保存したら詳細画面を自動で閉じる
+      setSavedFlash(true);
+      setTimeout(() => setSavedFlash(false), 1800);
+    }
+    setSaving(false);
+  };
+
+  const openCard = cards.find((c) => c.id === openCardId);
+
+  const startEdit = () => {
+    if (!openCard) return;
+    setEditTitle(openCard.title);
+    setEditAssignee(openCard.assignee);
+    setEditDesc(openCard.description);
+    const d = new Date(openCard.createdAt);
+    setEditDate(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`);
+    setEditMode(true);
+  };
+
+  // タイトル・担当者・概要・登録日の編集を保存
+  const saveCardEdit = async () => {
+    if (!editTitle.trim()) return;
+    const next = cards.map((c) => {
+      if (c.id !== openCardId) return c;
+      let createdAt = c.createdAt;
+      if (editDate) {
+        const old = new Date(c.createdAt);
+        const [y, m, d] = editDate.split("-").map(Number);
+        const nd = new Date(y, m - 1, d, old.getHours(), old.getMinutes()); // 時刻は維持
+        createdAt = nd.toISOString();
+      }
+      return {
+        ...c,
+        title: editTitle.trim(),
+        assignee: editAssignee.trim(),
+        description: editDesc.trim(),
+        createdAt,
+        updatedAt: new Date().toISOString(),
+      };
+    });
+    if (await persist(next)) {
+      setCards(next);
+      setEditMode(false);
+    }
+  };
+
+  // メモの編集を保存
+  const saveNoteEdit = async () => {
+    if (editingNoteIdx === null || !editNoteText.trim()) return;
+    const next = cards.map((c) =>
+      c.id === openCardId
+        ? {
+            ...c,
+            notes: c.notes.map((n, i) =>
+              i === editingNoteIdx ? { ...n, text: editNoteText.trim() } : n
+            ),
+            updatedAt: new Date().toISOString(),
+          }
+        : c
+    );
+    if (await persist(next)) {
+      setCards(next);
+      setEditingNoteIdx(null);
+      setEditNoteText("");
+    }
+  };
+
+  const deleteNote = async (idx) => {
+    const next = cards.map((c) =>
+      c.id === openCardId
+        ? { ...c, notes: c.notes.filter((_, i) => i !== idx), updatedAt: new Date().toISOString() }
+        : c
+    );
+    if (await persist(next)) {
+      setCards(next);
+      setEditingNoteIdx(null);
+      setEditNoteText("");
+    }
+  };
+
+  const closeDetail = () => {
+    setOpenCardId(null);
+    setEditMode(false);
+    setEditingNoteIdx(null);
+    setEditNoteText("");
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-100" style={{ fontFamily: "'Hiragino Kaku Gothic ProN','Noto Sans JP',sans-serif" }}>
+      {/* ヘッダー */}
+      <header className="bg-slate-900 text-white px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="w-2 h-8 bg-indigo-400" />
+          <div>
+            <h1 className="text-lg font-bold tracking-wide">業務管理ボード</h1>
+            <p className="text-xs text-slate-400">課題カードを作成し、進捗をメモで追記</p>
+          </div>
+        </div>
+        <button
+          onClick={() => setShowNew(true)}
+          className="flex items-center gap-2 bg-indigo-500 hover:bg-indigo-400 text-white text-sm font-semibold px-4 py-2 rounded"
+        >
+          <Plus size={16} /> 新規カード
+        </button>
+      </header>
+
+      {/* ボード切替メニューバー */}
+      <nav className="bg-white border-b border-slate-200 px-4 md:px-6 flex items-center gap-1 overflow-x-auto">
+        {boards.map((b) => (
+          <button
+            key={b.id}
+            draggable
+            onDragStart={(e) => {
+              e.dataTransfer.setData("board", b.id); // カード用のtext/plainとは区別
+              e.dataTransfer.effectAllowed = "move";
+              setDraggingBoardId(b.id);
+            }}
+            onDragEnd={() => { setDraggingBoardId(null); setDragOverBoardId(null); }}
+            onDragOver={(e) => {
+              if (!draggingBoardId) return;
+              e.preventDefault();
+              setDragOverBoardId(b.id);
+            }}
+            onDrop={(e) => {
+              if (!draggingBoardId) return;
+              e.preventDefault();
+              reorderBoards(draggingBoardId, b.id);
+              setDraggingBoardId(null);
+              setDragOverBoardId(null);
+            }}
+            onClick={() => switchBoard(b.id)}
+            className={`shrink-0 text-sm px-4 py-2.5 border-b-2 font-semibold cursor-grab active:cursor-grabbing ${
+              b.id === activeBoardId
+                ? "border-indigo-600 text-indigo-700"
+                : "border-transparent text-slate-500 hover:text-slate-800 hover:bg-slate-50"
+            } ${draggingBoardId === b.id ? "opacity-40" : ""} ${
+              dragOverBoardId === b.id && draggingBoardId && draggingBoardId !== b.id ? "bg-indigo-50 rounded-t" : ""
+            }`}
+          >
+            {b.name}
+          </button>
+        ))}
+        <button
+          onClick={() => { setBoardName(""); setShowNewBoard(true); }}
+          className="shrink-0 flex items-center gap-1 text-xs px-3 py-1.5 ml-2 my-1.5 rounded border border-dashed border-slate-300 text-slate-500 hover:border-indigo-400 hover:text-indigo-600"
+        >
+          <Plus size={13} /> 新規ボード
+        </button>
+      </nav>
+
+      {error && (
+        <div className="bg-rose-100 text-rose-800 text-sm px-6 py-2 flex justify-between items-center">
+          <span>{error}</span>
+          <button onClick={() => setError("")} className="underline">閉じる</button>
+        </div>
+      )}
+
+      {/* ボード */}
+      {loading ? (
+        <div className="p-12 text-center text-slate-500 text-sm">読み込み中…</div>
+      ) : (
+        <main
+          className="p-4 md:p-6 flex gap-4 max-w-7xl mx-auto overflow-x-auto items-stretch"
+          style={{ height: "calc(100vh - 132px)" }}
+        >
+          {STATUSES.map((s) => {
+            const list = cards.filter((c) => c.status === s.key);
+            const totalPages = Math.max(1, Math.ceil(list.length / CARDS_PER_PAGE));
+            const page = Math.min(pages[s.key], totalPages - 1);
+            const visible = list.slice(page * CARDS_PER_PAGE, (page + 1) * CARDS_PER_PAGE);
+            return (
+              <section
+                key={s.key}
+                onDragOver={(e) => { e.preventDefault(); setDragOverCol(s.key); }}
+                onDragLeave={() => setDragOverCol((v) => (v === s.key ? null : v))}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const id = e.dataTransfer.getData("text/plain") || draggingId;
+                  if (id) moveCardTo(id, s.key);
+                  setDragOverCol(null);
+                  setDraggingId(null);
+                }}
+                className={`bg-white rounded-lg shadow-sm border-t-4 ${s.header} flex-1 min-w-60 shrink-0 flex flex-col overflow-hidden ${
+                  dragOverCol === s.key && draggingId ? "ring-2 ring-indigo-400 bg-indigo-50" : ""
+                }`}
+              >
+                <div className="px-4 py-3 flex items-center justify-between border-b border-slate-100 shrink-0">
+                  <div className="flex items-center gap-2">
+                    <span className={`w-2.5 h-2.5 rounded-full ${s.dot}`} />
+                    <h2 className="font-bold text-slate-800">{s.label}</h2>
+                  </div>
+                  <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${s.badge}`}>{list.length}</span>
+                </div>
+                <div className="p-3 space-y-3 flex-1 overflow-hidden">
+                  {list.length === 0 && (
+                    <p className="text-xs text-slate-400 text-center py-6">カードはありません</p>
+                  )}
+                  {visible.map((c) => (
+                    <article
+                      key={c.id}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.setData("text/plain", c.id);
+                        e.dataTransfer.effectAllowed = "move";
+                        setDraggingId(c.id);
+                      }}
+                      onDragEnd={() => { setDraggingId(null); setDragOverCol(null); }}
+                      onClick={() => { setOpenCardId(c.id); setMemo(""); setEditMode(false); setEditingNoteIdx(null); }}
+                      className={`border border-slate-200 rounded-lg px-3 py-2 hover:border-indigo-400 hover:shadow bg-white cursor-grab active:cursor-grabbing ${
+                        draggingId === c.id ? "opacity-40" : ""
+                      }`}
+                    >
+                      <h3 className="font-semibold text-slate-800 text-sm leading-snug truncate">{c.title}</h3>
+                      <div className="flex items-center gap-3 mt-1 text-xs text-slate-500">
+                        <span className="flex items-center gap-1 min-w-0">
+                          <User size={12} className="shrink-0" />
+                          <span className="truncate inline-block min-w-12">{c.assignee || "\u00A0"}</span>
+                        </span>
+                        <span className="flex items-center gap-1 shrink-0"><Clock size={12} />{fmtDate(c.createdAt).split(" ")[0]}</span>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+                {totalPages > 1 && (
+                  <div className="px-3 py-2 border-t border-slate-100 flex items-center justify-between shrink-0 bg-slate-50">
+                    <button
+                      onClick={() => setPages((p) => ({ ...p, [s.key]: Math.max(0, page - 1) }))}
+                      disabled={page === 0}
+                      className="p-1 rounded hover:bg-slate-200 disabled:opacity-20 text-slate-600"
+                      title="前のページ"
+                    >
+                      <ChevronLeft size={16} />
+                    </button>
+                    <span className="text-xs text-slate-500 font-semibold">{page + 1} / {totalPages} ページ</span>
+                    <button
+                      onClick={() => setPages((p) => ({ ...p, [s.key]: Math.min(totalPages - 1, page + 1) }))}
+                      disabled={page >= totalPages - 1}
+                      className="p-1 rounded hover:bg-slate-200 disabled:opacity-20 text-slate-600"
+                      title="次のページ"
+                    >
+                      <ChevronRight size={16} />
+                    </button>
+                  </div>
+                )}
+              </section>
+            );
+          })}
+        </main>
+      )}
+
+      {/* 新規ボード作成モーダル */}
+      {showNewBoard && (
+        <div className="fixed inset-0 bg-slate-900 bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-lg shadow-xl w-full max-w-sm">
+            <div className="px-5 py-4 border-b border-slate-100 flex justify-between items-center">
+              <h2 className="font-bold text-slate-800">新規ボード作成</h2>
+              <button onClick={() => setShowNewBoard(false)} className="text-slate-400 hover:text-slate-700"><X size={18} /></button>
+            </div>
+            <div className="p-5">
+              <label className="block text-xs font-semibold text-slate-600 mb-1">ボード名 <span className="text-rose-500">*</span></label>
+              <input
+                value={boardName}
+                onChange={(e) => setBoardName(e.target.value)}
+                className="w-full border border-slate-300 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500"
+                placeholder={`例: ${currentNendo()}`}
+              />
+              <p className="text-xs text-slate-400 mt-2">作成後、新しい空のボードに切り替わります。過去のボードはメニューバーからいつでも閲覧できます。</p>
+            </div>
+            <div className="px-5 py-4 border-t border-slate-100 flex justify-end gap-2">
+              <button onClick={() => setShowNewBoard(false)} className="text-sm px-4 py-2 rounded text-slate-600 hover:bg-slate-100">キャンセル</button>
+              <button
+                onClick={createBoard}
+                disabled={!boardName.trim()}
+                className="text-sm px-4 py-2 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-semibold disabled:opacity-40"
+              >
+                作成する
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 新規カード作成モーダル */}
+      {showNew && (
+        <div className="fixed inset-0 bg-slate-900 bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-lg shadow-xl w-full max-w-md">
+            <div className="px-5 py-4 border-b border-slate-100 flex justify-between items-center">
+              <h2 className="font-bold text-slate-800">新規カード作成</h2>
+              <button onClick={() => setShowNew(false)} className="text-slate-400 hover:text-slate-700"><X size={18} /></button>
+            </div>
+            <div className="p-5 space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">課題タイトル <span className="text-rose-500">*</span></label>
+                <input
+                  value={title}
+                  onChange={(e) => setTitle(e.target.value)}
+                  className="w-full border border-slate-300 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500"
+                  placeholder="例: 請求書フォーマットの見直し"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">概要</label>
+                <textarea
+                  value={desc}
+                  onChange={(e) => setDesc(e.target.value)}
+                  rows={3}
+                  className="w-full border border-slate-300 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500 resize-none"
+                  placeholder="課題の内容や背景を記入"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">担当者</label>
+                <input
+                  value={assignee}
+                  onChange={(e) => setAssignee(e.target.value)}
+                  className="w-full border border-slate-300 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500"
+                  placeholder="例: 田中"
+                />
+              </div>
+            </div>
+            <div className="px-5 py-4 border-t border-slate-100 flex justify-end gap-2">
+              <button onClick={() => setShowNew(false)} className="text-sm px-4 py-2 rounded text-slate-600 hover:bg-slate-100">キャンセル</button>
+              <button
+                onClick={addCard}
+                disabled={!title.trim()}
+                className="text-sm px-4 py-2 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-semibold disabled:opacity-40"
+              >
+                作成する
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* カード詳細モーダル */}
+      {openCard && (
+        <div className="fixed inset-0 bg-slate-900 bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-lg shadow-xl w-full max-w-lg max-h-full overflow-y-auto">
+            <div className="px-5 py-4 border-b border-slate-100 flex justify-between items-start gap-4">
+              <div className="min-w-0">
+                <span className={`inline-block text-xs font-semibold px-2 py-0.5 rounded-full mb-1 ${STATUSES.find((s) => s.key === openCard.status).badge}`}>
+                  {STATUSES.find((s) => s.key === openCard.status).label}
+                </span>
+                {!editMode && <h2 className="font-bold text-slate-800 leading-snug">{openCard.title}</h2>}
+              </div>
+              <div className="flex items-center gap-1 shrink-0">
+                {!editMode && (
+                  <button
+                    onClick={startEdit}
+                    className="flex items-center gap-1 text-xs px-2 py-1 rounded text-indigo-600 hover:bg-indigo-50 font-semibold"
+                  >
+                    <Pencil size={13} /> 編集
+                  </button>
+                )}
+                <button onClick={closeDetail} className="text-slate-400 hover:text-slate-700 p-1"><X size={18} /></button>
+              </div>
+            </div>
+
+            <div className="p-5 space-y-5">
+              {editMode ? (
+                /* 基本情報の編集フォーム */
+                <div className="space-y-3 bg-indigo-50 border border-indigo-100 rounded-lg p-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-1">課題タイトル <span className="text-rose-500">*</span></label>
+                    <input
+                      value={editTitle}
+                      onChange={(e) => setEditTitle(e.target.value)}
+                      className="w-full border border-slate-300 rounded px-3 py-2 text-sm bg-white focus:outline-none focus:border-indigo-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 mb-1">概要</label>
+                    <textarea
+                      value={editDesc}
+                      onChange={(e) => setEditDesc(e.target.value)}
+                      rows={3}
+                      className="w-full border border-slate-300 rounded px-3 py-2 text-sm bg-white focus:outline-none focus:border-indigo-500 resize-none"
+                    />
+                  </div>
+                  <div className="flex gap-3">
+                    <div className="flex-1">
+                      <label className="block text-xs font-semibold text-slate-600 mb-1">担当者</label>
+                      <input
+                        value={editAssignee}
+                        onChange={(e) => setEditAssignee(e.target.value)}
+                        className="w-full border border-slate-300 rounded px-3 py-2 text-sm bg-white focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                    <div className="flex-1">
+                      <label className="block text-xs font-semibold text-slate-600 mb-1">登録日</label>
+                      <input
+                        type="date"
+                        value={editDate}
+                        onChange={(e) => setEditDate(e.target.value)}
+                        className="w-full border border-slate-300 rounded px-3 py-2 text-sm bg-white focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex justify-end gap-2 pt-1">
+                    <button onClick={() => setEditMode(false)} className="text-xs px-3 py-2 rounded text-slate-600 hover:bg-white">キャンセル</button>
+                    <button
+                      onClick={saveCardEdit}
+                      disabled={!editTitle.trim()}
+                      className="text-xs px-4 py-2 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-semibold disabled:opacity-40"
+                    >
+                      変更を保存
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {openCard.description && (
+                    <p className="text-sm text-slate-600 whitespace-pre-wrap">{openCard.description}</p>
+                  )}
+                  <div className="flex flex-wrap gap-4 text-xs text-slate-500">
+                    <span className="flex items-center gap-1">
+                      <User size={13} />担当: <span className="inline-block min-w-12">{openCard.assignee || "\u00A0"}</span>
+                    </span>
+                    <span className="flex items-center gap-1"><Clock size={13} />登録: {fmtDate(openCard.createdAt)}</span>
+                  </div>
+                </>
+              )}
+
+              {/* ステータス変更 */}
+              <div>
+                <p className="text-xs font-semibold text-slate-600 mb-2">ステータスを変更</p>
+                <div className="flex gap-2">
+                  {STATUSES.map((s) => (
+                    <button
+                      key={s.key}
+                      onClick={async () => {
+                        const next = cards.map((c) =>
+                          c.id === openCard.id ? { ...c, status: s.key, updatedAt: new Date().toISOString() } : c
+                        );
+                        if (await persist(next)) setCards(next);
+                      }}
+                      className={`flex-1 text-xs font-semibold py-2 rounded border ${
+                        openCard.status === s.key
+                          ? "bg-slate-800 text-white border-slate-800"
+                          : "border-slate-300 text-slate-600 hover:bg-slate-50"
+                      }`}
+                    >
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* メモ一覧 */}
+              <div>
+                <p className="text-xs font-semibold text-slate-600 mb-2">メモ({openCard.notes.length}件)</p>
+                {openCard.notes.length === 0 ? (
+                  <p className="text-xs text-slate-400 border border-dashed border-slate-200 rounded p-4 text-center">
+                    まだメモはありません。進捗やミーティング内容を追記しましょう。
+                  </p>
+                ) : (
+                  <ul className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                    {openCard.notes
+                      .map((n, idx) => ({ ...n, idx })) // 元のインデックスを保持
+                      .reverse()
+                      .map((n) => (
+                        <li key={n.idx} className="bg-slate-50 border-l-2 border-indigo-400 rounded-r px-3 py-2">
+                          {editingNoteIdx === n.idx ? (
+                            <div>
+                              <textarea
+                                value={editNoteText}
+                                onChange={(e) => setEditNoteText(e.target.value)}
+                                rows={3}
+                                className="w-full border border-slate-300 rounded px-2 py-1.5 text-sm bg-white focus:outline-none focus:border-indigo-500 resize-none"
+                              />
+                              <div className="flex justify-between items-center mt-1.5">
+                                <button
+                                  onClick={() => deleteNote(n.idx)}
+                                  className="flex items-center gap-1 text-xs px-2 py-1 rounded text-rose-600 hover:bg-rose-50"
+                                >
+                                  <Trash2 size={12} /> 削除
+                                </button>
+                                <div className="flex gap-1">
+                                  <button
+                                    onClick={() => { setEditingNoteIdx(null); setEditNoteText(""); }}
+                                    className="text-xs px-2 py-1 rounded text-slate-600 hover:bg-slate-200"
+                                  >
+                                    キャンセル
+                                  </button>
+                                  <button
+                                    onClick={saveNoteEdit}
+                                    disabled={!editNoteText.trim()}
+                                    className="text-xs px-3 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-semibold disabled:opacity-40"
+                                  >
+                                    保存
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="flex justify-between items-start gap-2">
+                              <div className="min-w-0">
+                                <p className="text-sm text-slate-700 whitespace-pre-wrap">{n.text}</p>
+                                <p className="text-xs text-slate-400 mt-1">{fmtDate(n.date)}</p>
+                              </div>
+                              <button
+                                onClick={() => { setEditingNoteIdx(n.idx); setEditNoteText(n.text); }}
+                                className="p-1 rounded text-slate-400 hover:text-indigo-600 hover:bg-white shrink-0"
+                                title="このメモを編集"
+                              >
+                                <Pencil size={13} />
+                              </button>
+                            </div>
+                          )}
+                        </li>
+                      ))}
+                  </ul>
+                )}
+              </div>
+
+              {/* メモ追記 */}
+              <div>
+                <p className="text-xs font-semibold text-slate-600 mb-2">メモを追記</p>
+                <textarea
+                  value={memo}
+                  onChange={(e) => setMemo(e.target.value)}
+                  rows={3}
+                  className="w-full border border-slate-300 rounded px-3 py-2 text-sm focus:outline-none focus:border-indigo-500 resize-none"
+                  placeholder="進捗・ミーティング内容などを記入"
+                />
+                <div className="flex items-center justify-end mt-2">
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => deleteCard(openCard.id)}
+                      className="flex items-center gap-1 text-xs px-3 py-2 rounded text-rose-600 hover:bg-rose-50"
+                    >
+                      <Trash2 size={14} /> カードを削除
+                    </button>
+                    <button
+                      onClick={saveMemo}
+                      disabled={saving}
+                      className="text-sm px-5 py-2 rounded bg-indigo-600 hover:bg-indigo-500 text-white font-semibold disabled:opacity-40"
+                    >
+                      {saving ? "保存中…" : "保存"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* 保存完了トースト */}
+      {savedFlash && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-emerald-600 text-white text-sm font-semibold px-5 py-2.5 rounded-full shadow-lg z-50">
+          保存しました ✓
+        </div>
+      )}
+    </div>
+  );
+}
